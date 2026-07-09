@@ -1,6 +1,7 @@
 import os
 import json
 import psycopg2
+from psycopg2 import pool, sql
 import paho.mqtt.client as mqtt
 
 # --- Config from env ---
@@ -9,6 +10,8 @@ MQTT_PORT = int(os.environ["MQTT_PORT"])
 MQTT_USER = os.environ["MQTT_USER"]
 MQTT_PASSWORD = os.environ["MQTT_PASSWORD"]
 MQTT_TOPIC = os.environ["MQTT_TOPIC"]
+MQTT_TLS = os.environ.get("MQTT_TLS", "false").lower() == "true"
+MQTT_CA_CERT = os.environ.get("MQTT_CA_CERT", "/app/ca.crt")
 
 PG_HOST = os.environ["POSTGRES_HOST"]
 PG_PORT = os.environ.get("POSTGRES_PORT", "5432")
@@ -16,26 +19,38 @@ PG_DB = os.environ["POSTGRES_DB"]
 PG_USER = os.environ["POSTGRES_USER"]
 PG_PASSWORD = os.environ["POSTGRES_PASSWORD"]
 
+# --- Connection pool (creado una sola vez) ---
+db_pool = psycopg2.pool.SimpleConnectionPool(
+    minconn=1,
+    maxconn=10,
+    host=PG_HOST,
+    port=PG_PORT,
+    dbname=PG_DB,
+    user=PG_USER,
+    password=PG_PASSWORD
+)
+
 
 def table_name_for_topic(topic: str) -> str:
     return topic.strip("/").replace("/", "_")
 
 
 def ensure_table(cur, table: str):
-    cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS "{table}" (
+    query = sql.SQL("""
+        CREATE TABLE IF NOT EXISTS {table} (
             id SERIAL PRIMARY KEY,
             temp DOUBLE PRECISION,
             received_at TIMESTAMPTZ DEFAULT NOW()
         )
-    """)
+    """).format(table=sql.Identifier(table))
+    cur.execute(query)
 
 
 def insert_reading(cur, table: str, payload: dict):
-    cur.execute(
-        f'INSERT INTO "{table}" (temp) VALUES (%s)',
-        (payload.get("temp"),)
-    )
+    query = sql.SQL(
+        "INSERT INTO {table} (temp) VALUES (%s)"
+    ).format(table=sql.Identifier(table))
+    cur.execute(query, (payload.get("temp"),))
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -55,22 +70,19 @@ def on_message(client, userdata, msg):
 
     print(f"[mqtt] {topic} -> {payload}")
 
+    conn = None
     try:
-        conn = psycopg2.connect(
-            host=PG_HOST,
-            port=PG_PORT,
-            dbname=PG_DB,
-            user=PG_USER,
-            password=PG_PASSWORD
-        )
+        conn = db_pool.getconn()
         conn.autocommit = True
-        with conn:
-            with conn.cursor() as cur:
-                ensure_table(cur, table)
-                insert_reading(cur, table, payload)
+        with conn.cursor() as cur:
+            ensure_table(cur, table)
+            insert_reading(cur, table, payload)
         print(f"[db] stored in table '{table}'")
     except Exception as e:
         print(f"[db error] {e}")
+    finally:
+        if conn is not None:
+            db_pool.putconn(conn)
 
 
 def main():
@@ -78,6 +90,9 @@ def main():
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.on_connect = on_connect
     client.on_message = on_message
+
+    if MQTT_TLS:
+        client.tls_set(ca_certs=MQTT_CA_CERT)
 
     while True:
         try:
