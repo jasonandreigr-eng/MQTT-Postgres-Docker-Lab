@@ -39,6 +39,7 @@ def ensure_table(cur, table: str):
     query = sql.SQL("""
         CREATE TABLE IF NOT EXISTS {table} (
             id SERIAL PRIMARY KEY,
+            message_id TEXT UNIQUE,
             temp DOUBLE PRECISION,
             received_at TIMESTAMPTZ DEFAULT NOW()
         )
@@ -47,15 +48,17 @@ def ensure_table(cur, table: str):
 
 
 def insert_reading(cur, table: str, payload: dict):
-    query = sql.SQL(
-        "INSERT INTO {table} (temp) VALUES (%s)"
-    ).format(table=sql.Identifier(table))
-    cur.execute(query, (payload.get("temp"),))
+    query = sql.SQL("""
+        INSERT INTO {table} (message_id, temp)
+        VALUES (%s, %s)
+        ON CONFLICT (message_id) DO NOTHING
+    """).format(table=sql.Identifier(table))
+    cur.execute(query, (payload.get("message_id"), payload.get("temp")))
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print(f"[mqtt] connected rc={rc}, subscribing to {MQTT_TOPIC}")
-    client.subscribe(MQTT_TOPIC)
+    client.subscribe(MQTT_TOPIC, qos=1)
 
 
 def on_message(client, userdata, msg):
@@ -68,6 +71,10 @@ def on_message(client, userdata, msg):
         print(f"[warn] non-JSON payload on {topic}: {msg.payload!r}")
         return
 
+    if "message_id" not in payload:
+        print(f"[warn] payload missing message_id on {topic}: {payload}")
+        return
+
     print(f"[mqtt] {topic} -> {payload}")
 
     conn = None
@@ -77,7 +84,7 @@ def on_message(client, userdata, msg):
         with conn.cursor() as cur:
             ensure_table(cur, table)
             insert_reading(cur, table, payload)
-        print(f"[db] stored in table '{table}'")
+        print(f"[db] stored in table '{table}' (message_id={payload['message_id']})")
     except Exception as e:
         print(f"[db error] {e}")
     finally:
